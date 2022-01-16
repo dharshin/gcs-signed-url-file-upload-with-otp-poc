@@ -17,7 +17,7 @@ BUCKET='signedurl-poc-dds'
 MIN_SIZE=1 # 1 Byte
 MAX_SIZE=1000000 # 1 MB
 
-EXP=timedelta(seconds=600)
+EXPIRE_AFTER_SECONDS=600
 
 # Only for POC, this needs to come from a vault
 KEY=b'uEwvd9ZR8ukdEvvMSaE9ov6PVoAn1BB8SnE81rcWUqE'
@@ -30,23 +30,27 @@ def generate_filename():
     return f"{str(time())}-{urlsafe_b64encode(get_random_bytes(32)).decode('ASCII').strip('=')}"
 
 
-def generate_otp(file_name, user_id=0, contet_hash=''):
+def generate_otp(file_name, user_id='', contet_hash=''):
     '''
     Generates an OTP using the filename, user ID, content hash and a cryptographically secure random number.
     Just the random number should do it, but I'm being paranoid here. GCS API only validates the final value
     '''
-    nonce = urlsafe_b64encode(get_random_bytes(32)).decode('ASCII').strip('=')
-    content = bytes(f"{file_name}{str(user_id)}{contet_hash}{nonce}", "ASCII")
 
     hmac = HMAC.new(KEY, digestmod=SHA256)
-    hmac.update(content)
+    
+    hmac.update(
+        bytes(file_name, "ASCII") +
+        bytes(contet_hash, "ASCII") +
+        bytes(str(user_id), "ASCII") +
+        get_random_bytes(32) # nonce
+    )
 
     return hmac.hexdigest()
 
 
 def sign(request):
     """
-    Returns a signed URL (for file upload) and an OTP for 
+    Returns a signed URL (for file upload) and an OTP
     """
     credentials, project_id = auth.default()
     if credentials.token is None:
@@ -70,7 +74,7 @@ def sign(request):
     # mandatory fields
     sign_request = {
         "version": "v4",
-        "expiration": EXP,
+        "expiration": timedelta(seconds=EXPIRE_AFTER_SECONDS),
         "service_account_email": credentials.service_account_email,
         "access_token": credentials.token,
         "method": "PUT",
@@ -81,34 +85,45 @@ def sign(request):
 
     # Content MD5 is a standard integrity check in GCS
     content_md5 = ''
-    # "MD5! OMG the sky is fallling!"
-    # Calm down!...
-    #   1. This is just a checksum and the only one that we can use with GCS
-    #   2. It should be good enough for most use cases given the short validity
-    #      of the signed URL. 
-    #   3. If the use-case requires stronger checks a stronger hashing algorithm 
-    #      such as SHA-256 should be used, but the check has to be done after the object
-    #      has landed in the bucket as Google Cloud Storage does not support it as of
-    #      Jan 2022 
+    # If the use-case requires stronger checks a stronger hashing algorithm 
+    # such as SHA-256 should be used, but the check has to be done after the object
+    # has landed in the bucket as Google Cloud Storage does not support SHA256 as
+    # as an integrity checking machanism as of Jan 2022 
     if request_json and 'content-md5' in request_json:
         content_md5 = request_json['content-md5']
         sign_request['content_md5'] = content_md5
+
+
+    content_sha256 = ""
+    # GCS API will not perform the hash validation for PUT requests. Ideally this must be stored
+    # somewhere else (e.g. in a database) so that the files content can be read and SHA256 hash
+    # of the content can be calculated after the object lands in the bucket. This code avoides
+    # that step 
+    if request_json and 'content-sha256' in request_json:
+        content_sha256 = request_json['content-sha256']
+        headers['x-content-sha256'] = content_sha256
 
     uid = 0
     if request_json and 'user-id' in request_json:
         uid = int(request_json['user-id'])
 
-    # Adding custom headers in the request
-    header_json = {}
-    if "headers" in request.args:
-        header_json = json.loads(request.args.get('headers'))
 
-        for key, val in header_json.iteritems():
-            headers[key] = str(val)
+    # Adding custom headers in the request
+    if "headers" in request_json:
+        try:
+            for key, val in request_json['headers'].iteritems():
+                headers[key] = str(val)
+        except:
+            #TODO: log what the issue is. but this is just for a PoC
+            pass
 
     # adding the OTP
-    OTP = generate_otp(file_name, user_id=uid, contet_hash=content_md5)
-    headers['otp'] = OTP
+    OTP = generate_otp(
+        file_name, 
+        user_id=uid,
+        contet_hash=content_sha256 if len(content_sha256) > 0 else content_md5 # prefer SHA256 if present
+    )
+    headers['x-otp'] = OTP
 
 
     # Adding headers to the request
